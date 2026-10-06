@@ -1,0 +1,7 @@
+__pycache__/
+.venv/
+*.pt
+*_ncnn_model/
+*.csv
+*.mp4
+models/
