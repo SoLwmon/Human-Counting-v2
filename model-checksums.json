@@ -1,0 +1,18 @@
+[
+  {
+    "Path": "C:\\Code\\Human-Counting-\\yolo26n-pose.pt",
+    "Hash": "EB3BB8268828AEAF515CEC23A4BFAFD793944A86FE9AF94BA7823609C14522A9"
+  },
+  {
+    "Path": "C:\\Code\\Human-Counting-\\osnet_x0_25_msmt17.pt",
+    "Hash": "CF55163D78FC44C62C82F85AB62D39F10438679B5ABE8C698AE08CFA84AA6E18"
+  },
+  {
+    "Path": "C:\\Code\\Human-Counting-\\models\\face_detection_yunet_2023mar.onnx",
+    "Hash": "8F2383E4DD3CFBB4553EA8718107FC0423210DC964F9F4280604804ED2552FA4"
+  },
+  {
+    "Path": "C:\\Code\\Human-Counting-\\models\\face_recognition_sface_2021dec.onnx",
+    "Hash": "0BA9FBFA01B5270C96627C4EF784DA859931E02F04419C829E83484087C34E79"
+  }
+]

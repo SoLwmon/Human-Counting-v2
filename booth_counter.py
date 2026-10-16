@@ -7,6 +7,13 @@ Sources: a camera number (0, 1, ...), a video file, or a network camera address 
 import argparse
 import csv
 import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+from session_upload import api_endpoint, parse_recorded_at, recording_id, build_payload, save_payload, upload_payload
+from staff_identity import StaffMatcher
+from snapshot_capture import SnapshotCapture
 from dataclasses import dataclass, field
 
 import cv2
@@ -65,6 +72,9 @@ class Person:
     look_time: float = 0.0   # time spent standing still and facing the camera (kept as extra info)
     stay_time: float = 0.0   # total time on camera since being picked up in the counting zone
     last_t: float | None = None
+    detected_role: str = 'visitor'
+    staff_label: str | None = None
+    staff_match_score: float | None = None
 
     @property
     def visitor(self) -> bool:
@@ -147,10 +157,12 @@ def is_looking(kxy, kconf):
 
 
 class Counter:
-    def __init__(self, frame_shape, reid, faces=None):
+    def __init__(self, frame_shape, reid, faces=None, staff=None):
         h, w = frame_shape[:2]
         self.frame_w = w
         self.reid = reid
+        self.staff = staff
+        self.staff_checks: dict[int, float] = {}
         self.faces = faces                       # FaceID or None
         self.frame_h = h
         self.set_zone(ZONE)
@@ -368,6 +380,14 @@ class Counter:
         visible = sorted(q.pid for q, *_ in out)
         self.together |= {(a, b) for i, a in enumerate(visible) for b in visible[i + 1:]}
         self._merge_by_face(t)
+        if self.staff:
+            # Only new samples on visible identities can change a classification.
+            # Do not re-compare every historical visitor on every video frame.
+            for pid in self.frame_pids:
+                person = self.people.get(pid)
+                if person is not None and self.staff_checks.get(pid) != person.last_gallery_t:
+                    self.staff.classify(person)
+                    self.staff_checks[pid] = person.last_gallery_t
 
         def current(pid):  # follow any merges made during this frame
             while pid in self.remap:
@@ -400,6 +420,10 @@ class Counter:
         self.remap[drop.pid] = keep.pid
         if drop.pid in self.frame_pids:
             self.frame_pids = (self.frame_pids - {drop.pid}) | {keep.pid}
+        if drop.detected_role == 'staff' and keep.detected_role != 'staff':
+            keep.detected_role, keep.staff_label, keep.staff_match_score = drop.detected_role, drop.staff_label, drop.staff_match_score
+        self.staff_checks.pop(keep.pid, None)
+        self.staff_checks.pop(drop.pid, None)
         keep.first_seen = min(keep.first_seen, drop.first_seen)
         keep.last_seen = max(keep.last_seen, drop.last_seen)
         keep.look_time += drop.look_time
@@ -428,8 +452,8 @@ def draw(frame, counter, tracked):
     cv2.putText(frame, "Counting zone", (x1 + 6, y1 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 200, 0), 2)
     h, w = frame.shape[:2]
     for p, box, kxy, kconf in tracked:
-        colour = (0, 200, 0) if p.visitor else (200, 200, 200)
-        label = f"ID {p.pid}  {p.stay_time:.1f}s"
+        colour = (0, 180, 255) if p.detected_role == 'staff' else (0, 200, 0) if p.visitor else (200, 200, 200)
+        label = f"ID {p.pid}  {p.stay_time:.1f}s" + (f" STAFF: {p.staff_label}" if p.detected_role == "staff" else "")
         # Label sits above the person's head on a dark background, kept inside the frame
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
         x = int(np.clip((box[0] + box[2]) / 2 - tw / 2, 0, w - tw - 8))
@@ -437,7 +461,7 @@ def draw(frame, counter, tracked):
         cv2.rectangle(frame, (x, y - th - 8), (x + tw + 8, y + 4), (0, 0, 0), -1)
         cv2.putText(frame, label, (x + 4, y - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, colour, 2)
     total = len(counter.people)
-    visitors = sum(p.visitor for p in counter.people.values())
+    visitors = sum(p.visitor and p.detected_role != "staff" for p in counter.people.values())
     cv2.rectangle(frame, (0, 0), (w, HEADER_H), (0, 0, 0), -1)
     cv2.putText(frame, f"Unique people: {total}   Visitors: {visitors}", (12, 27),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
@@ -447,12 +471,12 @@ def draw(frame, counter, tracked):
 def write_csv(path, counter):
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["id", "first_seen_s", "last_seen_s", "time_on_camera_s", "visitor", "look_time_s"])
+        w.writerow(["id", "first_seen_s", "last_seen_s", "time_on_camera_s", "visitor", "look_time_s", "person_role", "staff_label"])
         for p in sorted(counter.people.values(), key=lambda p: p.pid):
             w.writerow([p.pid, f"{p.first_seen:.1f}", f"{p.last_seen:.1f}",
-                        f"{p.stay_time:.1f}", "yes" if p.visitor else "no", f"{p.look_time:.1f}"])
+                        f"{p.stay_time:.1f}", "yes" if p.visitor and p.detected_role != "staff" else "no", f"{p.look_time:.1f}", p.detected_role, p.staff_label or ""])
     ppl = counter.people.values()
-    print(f"Saved {path}: {len(ppl)} unique people, {sum(p.visitor for p in ppl)} visitors")
+    print(f"Saved {path}: {len(ppl)} unique people, {sum(p.visitor and p.detected_role != 'staff' for p in ppl)} visitors, {sum(p.detected_role == 'staff' for p in ppl)} staff records")
 
 
 def main():
@@ -477,6 +501,16 @@ def main():
     ap.add_argument("--record", default="", help="also save the raw camera video to this file, e.g. session.mp4")
     ap.add_argument("--save-screen", default="",
                     help="save what the window shows (skeletons, IDs, zone, counts) to this file, e.g. screen.mp4")
+    ap.add_argument("--api-url", default="", help="Upload results after processing to the website root URL or batch endpoint")
+    ap.add_argument("--recorded-at", default="", help="Recording start time with timezone, e.g. 2026-10-12T09:00:00+08:00; 'now' allowed for live cameras")
+    ap.add_argument("--camera-id", default="booth-1", help="Stable camera name used in uploaded visitor IDs")
+    ap.add_argument("--json-out", default="", help="Save an API payload even without uploading; requires --recorded-at")
+    ap.add_argument("--campaign-id", default="legacy", help="Campaign ID copied from the website")
+    ap.add_argument("--staff-profiles", default="", help="Local JSON file produced by enroll_staff.py")
+    ap.add_argument("--staff-body-match", type=float, default=0.85)
+    ap.add_argument("--staff-face-match", type=float, default=0.45)
+    ap.add_argument("--snapshot-interval", type=int, choices=[60, 300], default=60, help="Camera snapshot interval in recording seconds")
+    ap.add_argument("--snapshots-dir", default="", help="Folder for JPEG evidence; defaults to captures/<recording ID>")
     args = ap.parse_args()
     if args.list_cameras:
         print("Cameras this computer can open:")
@@ -485,6 +519,28 @@ def main():
 
     src = int(args.source) if args.source.isdigit() else args.source
     is_file = not is_live(src)
+    exporting = bool(args.api_url or args.json_out or args.snapshots_dir)
+    if exporting and not is_file:
+        ap.error("Campaign snapshots and staff evidence uploads currently require a recorded video file.")
+    recorded_at = None
+    run_id = None
+    if exporting:
+        try:
+            if len(args.camera_id) > 120 or not args.camera_id.strip():
+                raise ValueError('--camera-id must be a non-empty name up to 120 characters.')
+            if args.api_url:
+                api_endpoint(args.api_url)
+            if args.recorded_at == 'now' and not is_file:
+                pass  # Capture the actual run clock immediately before processing starts.
+            else:
+                recorded_at = parse_recorded_at(args.recorded_at)
+            if is_file:
+                run_id = recording_id(src, recorded_at, args.camera_id)
+                if args.campaign_id != "legacy":
+                    import hashlib
+                    run_id = hashlib.sha256(f"{run_id}:{args.campaign_id}".encode()).hexdigest()
+        except (ValueError, OSError) as error:
+            ap.error(str(error))
     cap = cv2.VideoCapture(src) if is_file else LiveCamera(src)
     if not (cap.isOpened() if is_file else cap.opened):
         kind = "video file" if is_file else "camera"
@@ -496,7 +552,14 @@ def main():
     model = YOLO(args.model, task="pose")
     reid = ReID(args.reid)
     faces = FaceID() if args.faces else None
+    staff = StaffMatcher(args.staff_profiles, args.reid, args.staff_body_match, args.staff_face_match) if args.staff_profiles else None
+    snapshots = SnapshotCapture(args.snapshots_dir or str(Path('captures') / run_id), run_id, args.snapshot_interval) if exporting else None
+    duration_s = cap.get(cv2.CAP_PROP_FRAME_COUNT) / fps if is_file else 0
     counter, frame_idx, start, tick = None, 0, time.time(), time.time()
+    if exporting and not is_file:
+        if recorded_at is None:
+            recorded_at = datetime.fromtimestamp(start, timezone.utc)
+        run_id = recording_id(str(src), recorded_at, args.camera_id, live_run_id=uuid.uuid4().hex)
     writer, raw_frames, screen_writer, screen_frames = None, 0, None, 0
     zone = {"rect": tuple(float(v) for v in args.zone.split(",")), "drag": None, "size": (1, 1)}
     if args.show:
@@ -521,6 +584,8 @@ def main():
 
         cv2.setMouseCallback("Booth Counter", on_mouse)
 
+    completed = False
+    reached_end = False
     try:
         while True:
             if args.duration and time.time() - start >= args.duration * 60:
@@ -529,6 +594,7 @@ def main():
             if is_file:
                 ok, frame = cap.read()
                 if not ok:
+                    reached_end = True
                     break
             else:
                 seen, frame = cap.read(seen)
@@ -546,17 +612,22 @@ def main():
                     writer.write(frame)
                     raw_frames += 1
             frame_idx += 1
+            video_t = (frame_idx - 1) / fps
+            if snapshots:
+                snapshots.periodic(frame, video_t)
             if frame_idx % args.skip:
                 continue
             # Video files use video time so tests match reality; cameras use wall-clock time
-            t = frame_idx / fps if is_file else time.time() - start
-            counter = counter or Counter(frame.shape, reid, faces)
+            t = (frame_idx - 1) / fps if is_file else time.time() - start
+            counter = counter or Counter(frame.shape, reid, faces, staff)
             zone["size"] = (frame.shape[1], frame.shape[0])
             counter.set_zone(zone["rect"])
             seen_frame = frame if args.no_enhance else enhance(frame)   # what the models look at
             result = model.track(seen_frame, persist=True, tracker="bytetrack.yaml",
                                  imgsz=args.imgsz, classes=[0], conf=DET_CONF, verbose=False)[0]
             tracked = counter.update(seen_frame, result, t)
+            if snapshots:
+                snapshots.people(frame, tracked, video_t, counter.remap)
             if args.show or args.save_screen:
                 # Skeletons are only drawn for people being tracked (inside the zone, or already given an ID)
                 vis = result[counter.shown].plot(boxes=False, labels=False, img=frame.copy()) if counter.shown else frame.copy()
@@ -583,6 +654,7 @@ def main():
                 cv2.imshow("Booth Counter", vis)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
+        completed = True
     finally:
         cap.release()
         if writer is not None:
@@ -600,6 +672,26 @@ def main():
                     w.writeheader()
                     w.writerows(counter.log)
                 print("Saved reid_log.csv")
+            if exporting:
+                payload = build_payload(counter.people.values(), recorded_at, run_id, args.camera_id)
+                payload['campaign_id'] = args.campaign_id
+                payload['recording'] = {'id': run_id, 'campaign_id': args.campaign_id, 'camera_id': args.camera_id, 'recorded_at': recorded_at.isoformat(), 'source_name': Path(str(src)).name, 'duration_s': round(duration_s, 3), 'snapshot_interval_s': args.snapshot_interval}
+                for session in payload['sessions']:
+                    session.update(campaign_id=args.campaign_id, recording_id=run_id)
+                payload['evidence'] = snapshots.manifest(payload['sessions'], run_id) if snapshots else []
+                json_path = args.json_out or str(Path(args.csv).with_suffix('.json'))
+                if snapshots:
+                    import os
+                    payload['evidence_directory'] = os.path.relpath(snapshots.directory.resolve(), Path(json_path).resolve().parent)
+                save_payload(payload, json_path)
+                if args.api_url and completed and reached_end:
+                    try:
+                        upload_payload(payload, args.api_url, payload_path=json_path)
+                    except (ValueError, RuntimeError) as error:
+                        print(f"Upload failed: {error}\nResults remain in {json_path}. Retry using session_upload.py.")
+                        raise SystemExit(1)
+                elif args.api_url:
+                    print('Processing stopped before the end of the recording. Partial results were saved locally and were not uploaded.')
 
 
 if __name__ == "__main__":

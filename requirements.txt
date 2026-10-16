@@ -1,3 +1,6 @@
-ultralytics>=8.4
-opencv-python
-lap
+ultralytics>=8.4,<9
+opencv-python>=4.10,<5
+numpy>=1.26,<3
+torch>=2.6,<3
+torchvision>=0.21,<1
+lap>=0.5.12,<1
