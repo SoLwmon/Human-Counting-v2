@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Booth Counter - Windows setup
 
 This machine is ready to run. Python 3.12 and the dependencies are installed locally under `.python` and `.venv`. Keep both folders in place. No virtual-environment activation or system Python installation is required.
@@ -84,3 +85,5 @@ See [CAMPAIGN-WORKFLOW.md](CAMPAIGN-WORKFLOW.md) for campaign setup, staff enrol
 ## A full day split into 24 clips
 
 Use [BATCH-PROCESSING.md](BATCH-PROCESSING.md) and `batch.cmd` to keep tracking across consecutive 30-minute clips, rather than starting 24 independent counters.
+
+
